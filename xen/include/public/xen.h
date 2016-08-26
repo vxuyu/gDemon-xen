@@ -100,8 +100,9 @@ DEFINE_XEN_GUEST_HANDLE(xen_ulong_t);
 #define __HYPERVISOR_domctl               36
 #define __HYPERVISOR_kexec_op             37
 #define __HYPERVISOR_tmem_op              38
-#define __HYPERVISOR_xc_reserved_op       39 /* reserved for XenClient */
+#define __HYPERVISOR_switch_gpu_iopt      39
 #define __HYPERVISOR_xenpmu_op            40
+#define __HYPERVISOR_lookup_gpu_addr      41
 
 /* Architecture-specific hypercall definitions. */
 #define __HYPERVISOR_arch_0               48

@@ -39,7 +39,7 @@ int __init iommu_setup_hpet_msi(struct msi_desc *msi)
     return ops->setup_hpet_msi ? ops->setup_hpet_msi(msi) : -ENODEV;
 }
 
-int arch_iommu_populate_page_table(struct domain *d)
+int do_arch_iommu_populate_page_table(struct domain *d, int is_gpu)
 {
     struct hvm_iommu *hd = domain_hvm_iommu(d);
     struct page_info *page;
@@ -65,9 +65,15 @@ int arch_iommu_populate_page_table(struct domain *d)
             {
                 ASSERT(!(gfn >> DEFAULT_DOMAIN_ADDRESS_WIDTH));
                 BUG_ON(SHARED_M2P(gfn));
-                rc = hd->platform_ops->map_page(d, gfn, mfn,
-                                                IOMMUF_readable |
-                                                IOMMUF_writable);
+
+                if ( is_gpu )
+                    rc = hd->platform_ops->gpu_map_page(d, gfn, mfn,
+                                                    IOMMUF_readable |
+                                                    IOMMUF_writable);
+                else
+                    rc = hd->platform_ops->map_page(d, gfn, mfn,
+                                                    IOMMUF_readable |
+                                                    IOMMUF_writable);
             }
             if ( rc )
             {
@@ -103,12 +109,22 @@ int arch_iommu_populate_page_table(struct domain *d)
     spin_unlock(&d->page_alloc_lock);
     this_cpu(iommu_dont_flush_iotlb) = 0;
 
-    if ( !rc )
+    if ( !rc && !is_gpu )
         iommu_iotlb_flush_all(d);
     else if ( rc != -ERESTART )
         iommu_teardown(d);
 
     return rc;
+}
+
+int arch_iommu_populate_page_table(struct domain *d)
+{
+    return do_arch_iommu_populate_page_table(d, 0);
+}
+
+int arch_iommu_populate_gpu_page_table(struct domain *d)
+{
+    return do_arch_iommu_populate_page_table(d, 1);
 }
 
 void __hwdom_init arch_iommu_check_autotranslated_hwdom(struct domain *d)

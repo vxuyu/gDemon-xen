@@ -818,6 +818,7 @@ static inline unsigned int p2m_get_iommu_flags(p2m_type_t p2mt)
         break;
     case p2m_ram_ro:
     case p2m_grant_map_ro:
+    // case p2m_mmio_write_dm:
         flags = IOMMUF_readable;
         break;
     default:

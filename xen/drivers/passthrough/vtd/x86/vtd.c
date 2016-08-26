@@ -31,6 +31,11 @@
 #include "../vtd.h"
 #include "../extern.h"
 
+/* gpu's separated high-mem iommu page directory machine address */
+u64 gpu_pgd_maddr = 0;
+/* gpu's separated low-mem iommu page directory machine address per domain */
+u64 dom_gpu_pgd_maddr[] = { [0 ... GPU_MAX_DOM - 1] = 0};
+
 /*
  * iommu_inclusive_mapping: when set, all memory below 4GB is included in dom0
  * 1:1 iommu mappings except xen and unusable regions.
@@ -116,6 +121,13 @@ void __hwdom_init vtd_set_hwdom_mapping(struct domain *d)
 
     top = max(max_pdx, pfn_to_pdx(0xffffffffUL >> PAGE_SHIFT) + 1);
 
+    /*
+    printk("xuyu: (%s:%d) max_pdx: %lx, top: %lx, hap_enabled: %s, iommu_hap_pt_share: %s\n",
+            __FUNCTION__, __LINE__, max_pdx, top,
+            hap_enabled(d) ? "enabled" : "disabled",
+            iommu_hap_pt_share ? "enabled" : "disabled");
+    */
+
     for ( i = 0; i < top; i++ )
     {
         /*
@@ -148,3 +160,53 @@ void __hwdom_init vtd_set_hwdom_mapping(struct domain *d)
     }
 }
 
+/*
+ * map the whole gpu space by one specified offset [pfn]
+ */
+void vtd_map_gpu_space_by_offset(struct domain *d, unsigned long offset)
+{
+    unsigned long i, j, tmp, top;
+    BUG_ON(!is_hardware_domain(d));
+
+    top = max(max_pdx, pfn_to_pdx(0xffffffffUL >> PAGE_SHIFT) + 1);
+
+    for ( i = 0; i < top; i++ )
+    {
+        unsigned long pfn = pdx_to_pfn(i);
+        if ( pfn > (0xffffffffUL >> PAGE_SHIFT) ?
+             (!mfn_valid(pfn) ||
+              !page_is_ram_type(pfn, RAM_TYPE_CONVENTIONAL)) :
+             iommu_inclusive_mapping ?
+             page_is_ram_type(pfn, RAM_TYPE_UNUSABLE) :
+             !page_is_ram_type(pfn, RAM_TYPE_CONVENTIONAL) )
+            continue;
+
+        /* Exclude Xen bits */
+        if ( xen_in_range(pfn) )
+            continue;
+
+        tmp = 1 << (PAGE_SHIFT - PAGE_SHIFT_4K);
+        for ( j = 0; j < tmp; j++ )
+            iommu_gpu_map_page(d, offset + pfn * tmp + j, pfn * tmp + j,
+                           IOMMUF_readable|IOMMUF_writable);
+
+        if (!(i & (0xfffff >> (PAGE_SHIFT - PAGE_SHIFT_4K))))
+            process_pending_softirqs();
+    }
+
+    /*
+    printk("xuyu: (%s:%d) gpu space remapping is done, offset: %lx\n",
+            __FUNCTION__, __LINE__, offset);
+    */
+}
+
+void __hwdom_init vtd_set_hwdom_gpu_mapping(struct domain *d)
+{
+    ASSERT(d == hardware_domain);
+    /* dom0 map [0, max_mem] to [0, max_mem] */
+    vtd_map_gpu_space_by_offset(d, 0);
+    /* gpu map [128G, 128G + max_mem] to [0, max_mem] */
+    vtd_map_gpu_space_by_offset(d, (1UL << GPU_HIGH_BIT_SHIFT) >> PAGE_SHIFT);
+    /* switch gpu's low memory to dom0's, initially */
+    iommu_switch_gpu_iopt(d->domain_id);
+}

@@ -23,6 +23,14 @@
 #include <asm/msi.h>
 
 /*
+ * GPU-related Intel IOMMU specification
+ */
+#define GPU_MAX_DOM     16
+#define GPU_HIGH_BIT_SHIFT   37
+#define GPU_TEST_PFN_HIGH_BIT(pfn) (((pfn) >> (GPU_HIGH_BIT_SHIFT - 12)) & 1)
+#define GPU_TEST_ADDR_HIGH_BIT(addr) (((addr) >> GPU_HIGH_BIT_SHIFT) & 1)
+
+/*
  * Intel IOMMU register specification per version 1.0 public spec.
  */
 

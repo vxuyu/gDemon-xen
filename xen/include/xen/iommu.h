@@ -49,8 +49,13 @@ extern bool_t amd_iommu_perdev_intremap;
 #define PAGE_MASK_64K           IOMMU_PAGE_MASK(64K)
 #define PAGE_ALIGN_64K(addr)    IOMMU_PAGE_ALIGN(64K, addr)
 
-int iommu_setup(void);
+int iommu_switch_gpu_iopt(int domain_id);
+int arch_iommu_populate_gpu_page_table(struct domain *d);
+int iommu_gpu_map_page(struct domain *d, unsigned long gfn,
+                        unsigned long mfn, unsigned int flags);
+unsigned long iommu_lookup_gpu_addr(unsigned long addr);
 
+int iommu_setup(void);
 int iommu_add_device(struct pci_dev *pdev);
 int iommu_enable_device(struct pci_dev *pdev);
 int iommu_remove_device(struct pci_dev *pdev);
@@ -150,6 +155,8 @@ struct iommu_ops {
     void (*teardown)(struct domain *d);
     int (*map_page)(struct domain *d, unsigned long gfn, unsigned long mfn,
                     unsigned int flags);
+    int (*gpu_map_page)(struct domain *d, unsigned long gfn, unsigned long mfn,
+                    unsigned int flags);
     int (*unmap_page)(struct domain *d, unsigned long gfn);
     void (*free_page_table)(struct page_info *);
 #ifdef CONFIG_X86
@@ -165,6 +172,8 @@ struct iommu_ops {
     void (*iotlb_flush_all)(struct domain *d);
     int (*get_reserved_device_memory)(iommu_grdm_t *, void *);
     void (*dump_p2m_table)(struct domain *d);
+    int (*switch_gpu_iopt)(struct domain *d);
+    unsigned long (*lookup_gpu_addr)(unsigned long addr);
 };
 
 void iommu_suspend(void);

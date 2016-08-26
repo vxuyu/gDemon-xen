@@ -249,6 +249,16 @@ int iommu_unmap_page(struct domain *d, unsigned long gfn)
     return hd->platform_ops->unmap_page(d, gfn);
 }
 
+int iommu_gpu_map_page(struct domain *d, unsigned long gfn,
+                    unsigned long mfn, unsigned int flags)
+{
+    struct hvm_iommu *hd = domain_hvm_iommu(d);
+    if ( !iommu_enabled || !hd->platform_ops )
+        return 0;
+
+    return hd->platform_ops->gpu_map_page(d, gfn, mfn, flags);
+}
+
 static void iommu_free_pagetables(unsigned long unused)
 {
     do {
@@ -423,6 +433,45 @@ static void iommu_dump_p2m_table(unsigned char key)
         printk("\ndomain%d IOMMU p2m table: \n", d->domain_id);
         ops->dump_p2m_table(d);
     }
+}
+
+/*
+ * switch the iommu page table of gpu device
+ * note: only the low memory (ppgtt space) is switched
+ */
+int iommu_switch_gpu_iopt(int domain_id)
+{
+    struct domain *d;
+    const struct iommu_ops *ops;
+
+    if ( !iommu_enabled )
+    {
+        return -1;
+    }
+
+    ops = iommu_get_ops();
+
+    for_each_domain(d)
+    {
+        if (d->domain_id == domain_id)
+        {
+            return ops->switch_gpu_iopt(d);
+        }
+    }
+
+    return -1;
+}
+
+/*
+ * addr parameter indicates
+ *  1.  output of gtt entry
+ *  2.  input of vt-d table
+ */
+unsigned long iommu_lookup_gpu_addr(unsigned long addr)
+{
+    const struct iommu_ops *ops;
+    ops = iommu_get_ops();
+    return ops->lookup_gpu_addr(addr);
 }
 
 /*

@@ -16,6 +16,12 @@
  */
 #define MMU_UPDATE_PREEMPTED          (~(~0U>>1))
 
+extern int
+do_switch_gpu_iopt(int domain_id);
+
+extern unsigned long
+do_lookup_gpu_addr(unsigned long addr);
+
 extern long
 do_event_channel_op_compat(
     XEN_GUEST_HANDLE_PARAM(evtchn_op_t) uop);

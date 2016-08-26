@@ -118,6 +118,28 @@ static int context_set_domain_id(struct context_entry *context,
     return 0;
 }
 
+static int gpu_context_set_domain_id(struct context_entry *context,
+                                 struct domain *d,
+                                 struct iommu *iommu)
+{
+    unsigned long nr_dom, i;
+
+    ASSERT(spin_is_locked(&iommu->lock));
+    nr_dom = cap_ndoms(iommu->cap);
+    i = nr_dom - 1;
+
+    if( test_bit(i, iommu->domid_bitmap) )
+    {
+        dprintk(XENLOG_ERR VTDPREFIX, "IOMMU: domain id for GPU is occupied\n");
+        return -EFAULT;
+    }
+
+    iommu->domid_map[i] = d->domain_id;
+    set_bit(i, iommu->domid_bitmap);
+    context->hi |= (i & ((1 << DID_FIELD_WIDTH) - 1)) << DID_HIGH_OFFSET;
+    return 0;
+}
+
 static int context_get_domain_id(struct context_entry *context,
                                  struct iommu *iommu)
 {
@@ -249,7 +271,7 @@ static u64 bus_to_context_maddr(struct iommu *iommu, u8 bus)
     return maddr;
 }
 
-static u64 addr_to_dma_page_maddr(struct domain *domain, u64 addr, int alloc)
+static u64 do_addr_to_dma_page_maddr(struct domain *domain, u64 addr, int alloc, int is_gpu)
 {
     struct acpi_drhd_unit *drhd;
     struct pci_dev *pdev;
@@ -262,7 +284,7 @@ static u64 addr_to_dma_page_maddr(struct domain *domain, u64 addr, int alloc)
 
     addr &= (((u64)1) << addr_width) - 1;
     ASSERT(spin_is_locked(&hd->arch.mapping_lock));
-    if ( hd->arch.pgd_maddr == 0 )
+    if ( !is_gpu && hd->arch.pgd_maddr == 0 )
     {
         /*
          * just get any passthrough device in the domainr - assume user
@@ -273,8 +295,32 @@ static u64 addr_to_dma_page_maddr(struct domain *domain, u64 addr, int alloc)
         if ( !alloc || ((hd->arch.pgd_maddr = alloc_pgtable_maddr(drhd, 1)) == 0) )
             goto out;
     }
+    if ( is_gpu )
+    {
+       if ( GPU_TEST_ADDR_HIGH_BIT(addr) && (gpu_pgd_maddr == 0) )
+       {
+           /* we assume gpu device is fixed at 00:02.0 */
+           pdev = pci_get_pdev_by_domain(hardware_domain, 0, 0, 16);
+           drhd = acpi_find_matched_drhd_unit(pdev);
+           if ( !alloc || ((gpu_pgd_maddr = alloc_pgtable_maddr(drhd, 1)) == 0) )
+               goto out;
+       }
+       if ( !GPU_TEST_ADDR_HIGH_BIT(addr) && (dom_gpu_pgd_maddr[domain->domain_id] == 0) )
+       {
+           /* we assume gpu device is fixed at 00:02.0 */
+           pdev = pci_get_pdev_by_domain(hardware_domain, 0, 0, 16);
+           drhd = acpi_find_matched_drhd_unit(pdev);
+           if ( !alloc || ((dom_gpu_pgd_maddr[domain->domain_id] = alloc_pgtable_maddr(drhd, 1)) == 0) )
+               goto out;
+       }
+    }
 
-    parent = (struct dma_pte *)map_vtd_domain_page(hd->arch.pgd_maddr);
+    parent = is_gpu ?
+                ( GPU_TEST_ADDR_HIGH_BIT(addr) ?
+                    (struct dma_pte *)map_vtd_domain_page(gpu_pgd_maddr) :
+                    (struct dma_pte *)map_vtd_domain_page(dom_gpu_pgd_maddr[domain->domain_id]) ) :
+                (struct dma_pte *)map_vtd_domain_page(hd->arch.pgd_maddr);
+
     while ( level > 1 )
     {
         offset = address_level_offset(addr, level);
@@ -286,7 +332,9 @@ static u64 addr_to_dma_page_maddr(struct domain *domain, u64 addr, int alloc)
             if ( !alloc )
                 break;
 
-            pdev = pci_get_pdev_by_domain(domain, -1, -1, -1);
+            pdev = is_gpu ?
+                    pci_get_pdev_by_domain(hardware_domain, 0, 0, 16) :
+                    pci_get_pdev_by_domain(domain, -1, -1, -1);
             drhd = acpi_find_matched_drhd_unit(pdev);
             pte_maddr = alloc_pgtable_maddr(drhd, 1);
             if ( !pte_maddr )
@@ -314,6 +362,16 @@ static u64 addr_to_dma_page_maddr(struct domain *domain, u64 addr, int alloc)
     unmap_vtd_domain_page(parent);
  out:
     return pte_maddr;
+}
+
+static u64 addr_to_dma_page_maddr(struct domain *domain, u64 addr, int alloc)
+{
+    return do_addr_to_dma_page_maddr(domain, addr, alloc, 0);
+}
+
+static u64 gpu_addr_to_dma_page_maddr(struct domain *domain, u64 addr, int alloc)
+{
+    return do_addr_to_dma_page_maddr(domain, addr, alloc, 1);
 }
 
 static void iommu_flush_write_buffer(struct iommu *iommu)
@@ -558,6 +616,24 @@ static void iommu_flush_all(void)
     }
 }
 
+/*
+static void iommu_flush_all_non_present(void)
+{
+    struct acpi_drhd_unit *drhd;
+    struct iommu *iommu;
+    int flush_dev_iotlb;
+
+    flush_all_cache();
+    for_each_drhd_unit ( drhd )
+    {
+        iommu = drhd->iommu;
+        iommu_flush_context_global(iommu, 1);
+        flush_dev_iotlb = find_ats_dev_drhd(iommu) ? 1 : 0;
+        iommu_flush_iotlb_global(iommu, 1, flush_dev_iotlb);
+    }
+}
+*/
+
 static void __intel_iommu_iotlb_flush(struct domain *d, unsigned long gfn,
         int dma_old_pte_present, unsigned int page_count)
 {
@@ -635,7 +711,8 @@ static void dma_pte_clear_one(struct domain *domain, u64 addr)
         return;
     }
 
-    dma_clear_pte(*pte);
+    // dma_clear_pte(*pte);
+
     spin_unlock(&hd->arch.mapping_lock);
     iommu_flush_cache_entry(pte, sizeof(struct dma_pte));
 
@@ -643,6 +720,14 @@ static void dma_pte_clear_one(struct domain *domain, u64 addr)
         __intel_iommu_iotlb_flush(domain, addr >> PAGE_SHIFT_4K, 1, 1);
 
     unmap_vtd_domain_page(page);
+
+    /*
+    if(domain->domain_id)
+    {
+        printk("xuyu (%s:%d) domain-%d, intend to unmap gpa addr %lx\n",
+                __FUNCTION__, __LINE__, domain->domain_id, addr);
+    }
+    */
 }
 
 static void iommu_free_pagetable(u64 pt_maddr, int level)
@@ -1259,6 +1344,9 @@ static void __hwdom_init intel_iommu_hwdom_init(struct domain *d)
     {
         /* Set up 1:1 page table for hardware domain. */
         vtd_set_hwdom_mapping(d);
+
+        /* Set up one separated iommu page table for gpu device. */
+        vtd_set_hwdom_gpu_mapping(d);
     }
 
     setup_hwdom_pci_devices(d, setup_hwdom_device);
@@ -1314,7 +1402,7 @@ int domain_context_mapping_one(
         {
             int cdomain;
             cdomain = context_get_domain_id(context, iommu);
-            
+
             if ( cdomain < 0 )
             {
                 printk(XENLOG_G_WARNING VTDPREFIX
@@ -1349,21 +1437,35 @@ int domain_context_mapping_one(
         spin_lock(&hd->arch.mapping_lock);
 
         /* Ensure we have pagetables allocated down to leaf PTE. */
-        if ( hd->arch.pgd_maddr == 0 )
+        if( !(bus == 0 && devfn == 16) )
         {
-            addr_to_dma_page_maddr(domain, 0, 1);
             if ( hd->arch.pgd_maddr == 0 )
             {
-            nomem:
-                spin_unlock(&hd->arch.mapping_lock);
-                spin_unlock(&iommu->lock);
-                unmap_vtd_domain_page(context_entries);
-                return -ENOMEM;
+                addr_to_dma_page_maddr(domain, 0, 1);
+                if ( hd->arch.pgd_maddr == 0 )
+                {
+                nomem:
+                    spin_unlock(&hd->arch.mapping_lock);
+                    spin_unlock(&iommu->lock);
+                    unmap_vtd_domain_page(context_entries);
+                    return -ENOMEM;
+                }
+            }
+        }
+        else
+        {
+            if ( gpu_pgd_maddr == 0 )
+            {
+                gpu_addr_to_dma_page_maddr(domain, 0, 1);
+                if ( gpu_pgd_maddr == 0 )
+                {
+                    goto nomem;
+                }
             }
         }
 
         /* Skip top levels of page tables for 2- and 3-level DRHDs. */
-        pgd_maddr = hd->arch.pgd_maddr;
+        pgd_maddr = (bus == 0 && devfn == 16) ? gpu_pgd_maddr : hd->arch.pgd_maddr;
         for ( agaw = level_to_agaw(4);
               agaw != level_to_agaw(iommu->nr_pt_levels);
               agaw-- )
@@ -1384,11 +1486,23 @@ int domain_context_mapping_one(
         spin_unlock(&hd->arch.mapping_lock);
     }
 
-    if ( context_set_domain_id(context, domain, iommu) )
+    if( !(bus == 0 && devfn == 16) )
     {
-        spin_unlock(&iommu->lock);
-        unmap_vtd_domain_page(context_entries);
-        return -EFAULT;
+        if ( context_set_domain_id(context, domain, iommu) )
+        {
+            spin_unlock(&iommu->lock);
+            unmap_vtd_domain_page(context_entries);
+            return -EFAULT;
+        }
+    }
+    else
+    {
+        if ( gpu_context_set_domain_id(context, domain, iommu) )
+        {
+            spin_unlock(&iommu->lock);
+            unmap_vtd_domain_page(context_entries);
+            return -EFAULT;
+        }
     }
 
     context_set_address_width(*context, agaw);
@@ -1693,9 +1807,9 @@ static void iommu_domain_teardown(struct domain *d)
     spin_unlock(&hd->arch.mapping_lock);
 }
 
-static int intel_iommu_map_page(
+static int do_intel_iommu_map_page(
     struct domain *d, unsigned long gfn, unsigned long mfn,
-    unsigned int flags)
+    unsigned int flags, int is_gpu)
 {
     struct hvm_iommu *hd = domain_hvm_iommu(d);
     struct dma_pte *page = NULL, *pte = NULL, old, new = { 0 };
@@ -1711,7 +1825,9 @@ static int intel_iommu_map_page(
 
     spin_lock(&hd->arch.mapping_lock);
 
-    pg_maddr = addr_to_dma_page_maddr(d, (paddr_t)gfn << PAGE_SHIFT_4K, 1);
+    pg_maddr = is_gpu ?
+                gpu_addr_to_dma_page_maddr(d, (paddr_t)gfn << PAGE_SHIFT_4K, 1) :
+                addr_to_dma_page_maddr(d, (paddr_t)gfn << PAGE_SHIFT_4K, 1);
     if ( pg_maddr == 0 )
     {
         spin_unlock(&hd->arch.mapping_lock);
@@ -1745,6 +1861,20 @@ static int intel_iommu_map_page(
         __intel_iommu_iotlb_flush(d, gfn, dma_pte_present(old), 1);
 
     return 0;
+}
+
+static int intel_iommu_map_page(
+    struct domain *d, unsigned long gfn, unsigned long mfn,
+    unsigned int flags)
+{
+    return do_intel_iommu_map_page(d, gfn, mfn, flags, 0);
+}
+
+static int intel_iommu_gpu_map_page(
+    struct domain *d, unsigned long gfn, unsigned long mfn,
+    unsigned int flags)
+{
+    return do_intel_iommu_map_page(d, gfn, mfn, flags, 1);
 }
 
 static int intel_iommu_unmap_page(struct domain *d, unsigned long gfn)
@@ -1792,7 +1922,7 @@ static int __init vtd_ept_page_compatible(struct iommu *iommu)
 
     /* EPT is not initialised yet, so we must check the capability in
      * the MSR explicitly rather than use cpu_has_vmx_ept_*() */
-    if ( rdmsr_safe(MSR_IA32_VMX_EPT_VPID_CAP, ept_cap) != 0 ) 
+    if ( rdmsr_safe(MSR_IA32_VMX_EPT_VPID_CAP, ept_cap) != 0 )
         return 0;
 
     return (ept_has_2mb(ept_cap) && opt_hap_2mb) == cap_sps_2mb(vtd_cap) &&
@@ -2518,6 +2648,236 @@ static void vtd_dump_p2m_table(struct domain *d)
     vtd_dump_p2m_table_level(hd->arch.pgd_maddr, agaw_to_level(hd->arch.agaw), 0, 0);
 }
 
+/*
+static struct domain *find_domain_by_id(int domain_id)
+{
+    struct domain *d;
+    for_each_domain(d)
+    {
+        if (d->domain_id == domain_id)
+        {
+            return d;
+        }
+    }
+    return NULL;
+}
+*/
+
+/*
+static u64 intel_iommu_get_pgd_maddr(struct domain *d, int seg, int bus, int devfn)
+{
+    struct hvm_iommu *hd;
+    struct pci_dev *pdev;
+    struct acpi_drhd_unit *drhd;
+    struct iommu *iommu;
+    u64 ctx_maddr, pgd_maddr;
+    struct context_entry *context, *context_entries;
+
+    hd = domain_hvm_iommu(d);
+
+    pdev = pci_get_pdev_by_domain(d, seg, bus, devfn);
+    drhd = acpi_find_matched_drhd_unit(pdev);
+    iommu = drhd->iommu;
+
+    ctx_maddr = bus_to_context_maddr(iommu, pdev->bus);
+    context_entries = (struct context_entry *)map_vtd_domain_page(ctx_maddr);
+    context = &context_entries[pdev->devfn];
+    pgd_maddr = context_address_root(*context);
+    unmap_vtd_domain_page(context_entries);
+
+    return pgd_maddr;
+}
+*/
+
+/*
+static void intel_iommu_set_ctx_domain_id(struct domain *dev_dom, struct domain *dom_to_set, int seg, int bus, int devfn)
+{
+    struct pci_dev *pdev;
+    struct acpi_drhd_unit *drhd;
+    struct iommu *iommu;
+    u64 ctx_maddr;
+    struct context_entry *context, *context_entries;
+
+    pdev = pci_get_pdev_by_domain(dev_dom, seg, bus, devfn);
+    drhd = acpi_find_matched_drhd_unit(pdev);
+    iommu = drhd->iommu;
+
+    ctx_maddr = bus_to_context_maddr(iommu, pdev->bus);
+    context_entries = (struct context_entry *)map_vtd_domain_page(ctx_maddr);
+    context = &context_entries[pdev->devfn];
+
+    context_set_domain_id(context, dom_to_set, iommu);
+    unmap_vtd_domain_page(context_entries);
+}
+*/
+
+/*
+ * get maddr of the [level] iommu page table
+ * pgd_maddr indicates the top-level(i.e., l4) page table root machine address
+ * if we want to get l3 page table maddr, then the offset of l4 page table is 0
+ */
+static u64 intel_iommu_get_page_table_maddr(u64 pgd_maddr, int level)
+{
+    struct dma_pte *parent, *pte = NULL;
+    u64 pte_maddr = 0;
+    int iter = 4 - level;
+
+    parent = (struct dma_pte *)map_vtd_domain_page(pgd_maddr);
+    while (iter--)
+    {
+        pte = &parent[0];
+        pte_maddr = dma_pte_addr(*pte);
+        unmap_vtd_domain_page(parent);
+        parent = (struct dma_pte *)map_vtd_domain_page(pte_maddr);
+    }
+
+    unmap_vtd_domain_page(parent);
+    return pte_maddr;
+}
+
+/*
+ * check and prepare the gpu iommu page table for the specified domain(u).
+ * theoretically, this function will alloc the gpu iommu page table only
+ * once, exactly when the specified domain(u) initializes its gpu device.
+ */
+static int iommu_set_dom_gpu_mapping(struct domain *d)
+{
+    struct hvm_iommu *hd;
+    if (dom_gpu_pgd_maddr[d->domain_id] == 0)
+    {
+        /* first check and reuse domu's iommu page table */
+        /* o.w., create one separated page table for gpu */
+        if ( (hd = domain_hvm_iommu(d)) && hd->arch.pgd_maddr )
+        {
+            dom_gpu_pgd_maddr[d->domain_id] = hd->arch.pgd_maddr;
+        }
+        else
+        {
+            while( -ERESTART == arch_iommu_populate_gpu_page_table(d) ) ;
+        }
+    }
+
+    return dom_gpu_pgd_maddr[d->domain_id] == 0 ? -1 : 0;
+}
+
+/*
+ * iommu iotlb page-selective-within-domain invalidation
+ * we just need to flush [0, 32G] of gpu iopt
+ */
+static int iommu_flush_gpu_iotlb(u64 addr, unsigned int order)
+{
+    struct pci_dev *pdev;
+    struct acpi_drhd_unit *drhd;
+    struct iommu *iommu;
+    unsigned long nr_dom, iommu_domid;
+    int flush_dev_iotlb;
+
+    pdev = pci_get_pdev_by_domain(hardware_domain, 0, 0, 16);
+    drhd = acpi_find_matched_drhd_unit(pdev);
+    if (!drhd)
+    {
+        /* drhd is not ready */
+        return 0;
+    }
+    iommu = drhd->iommu;
+    nr_dom = cap_ndoms(iommu->cap);
+    iommu_domid = nr_dom - 1;
+    flush_dev_iotlb = find_ats_dev_drhd(iommu) ? 1 : 0;
+
+    iommu_flush_iotlb_psi(iommu, iommu_domid, addr, order, 0, flush_dev_iotlb);
+    return 0;
+}
+
+static int intel_iommu_switch_gpu_iopt(struct domain *d)
+{
+    int i;
+    u64 cur_l3_maddr, swap_l3_maddr;
+    struct dma_pte *cur_parent, *swap_parent, *cur_pte, *swap_pte;
+
+    if (iommu_set_dom_gpu_mapping(d) == -1)
+        return -1;
+
+    cur_l3_maddr = intel_iommu_get_page_table_maddr(gpu_pgd_maddr, 3);
+    swap_l3_maddr = intel_iommu_get_page_table_maddr(dom_gpu_pgd_maddr[d->domain_id], 3);
+    cur_parent = (struct dma_pte *)map_vtd_domain_page(cur_l3_maddr);
+    swap_parent = (struct dma_pte *)map_vtd_domain_page(swap_l3_maddr);
+
+    for (i = 0; i < 32; i++)
+    {
+        cur_pte = &cur_parent[i];
+        swap_pte = &swap_parent[i];
+        /*
+        printk("xuyu: (%s:%d) before-%d: cur_pte: %lx, swap_pte: %lx\n",
+                __FUNCTION__, __LINE__, i, cur_pte->val, swap_pte->val);
+        */
+
+        cur_pte->val = swap_pte->val;
+        iommu_flush_cache_entry(cur_pte, sizeof(struct dma_pte));
+
+        /*
+        printk("xuyu: (%s:%d) after-%d: cur_pte: %lx, swap_pte: %lx\n",
+                __FUNCTION__, __LINE__, i, cur_pte->val, swap_pte->val);
+        */
+    }
+
+    /*
+    printk("xuyu: (%s:%d) gpu iopt is switched to domain-%d!\n",
+            __FUNCTION__, __LINE__, d->domain_id);
+    */
+
+    /* [TODO] do we need to set ctx domain_id when switching ? */
+    /* [SOLUTION] nope */
+    // intel_iommu_set_ctx_domain_id(hardware_domain, d, 0, 0, 16);
+
+    unmap_vtd_domain_page(cur_parent);
+    unmap_vtd_domain_page(swap_parent);
+
+    /* [TODO] what flush extent should we take */
+    // iommu_flush_all_non_present();
+    // iommu_flush_all();
+    /* [SOLUTION] page-selective flush */
+    /* 32G = 4K * 8M */
+    iommu_flush_gpu_iotlb(0, 23);
+
+    return 0;
+}
+
+static unsigned long intel_iommu_lookup_gpu_addr(unsigned long addr)
+{
+    struct dma_pte *parent, *pte = NULL;
+    u64 pte_maddr = 0;
+    int i;
+    uint32_t idx, *p;
+
+    ASSERT(0 != gpu_pgd_maddr);
+    parent = (struct dma_pte *)map_vtd_domain_page(gpu_pgd_maddr);
+    for (i = 3; i >= 0; i--)
+    {
+        idx = (addr >> (i * 9 + 12)) & ((1 << 9) - 1);
+        pte = &parent[idx];
+        /*
+        printk("xuyu: (%s:%d) %d-level gtt pte: %lx, vtd pte: %lx\n",
+                __FUNCTION__, __LINE__, i + 1, addr, pte->val);
+        */
+        pte_maddr = dma_pte_addr(*pte);
+        unmap_vtd_domain_page(parent);
+        parent = (struct dma_pte *)map_vtd_domain_page(pte_maddr);
+    }
+    // parent now points to the page
+    p = (uint32_t*) parent;
+    for (i = 0; i < 1024; i++)
+    {
+        if (!(i % 8))
+            printk("\n%08x", *(p + i));
+        else
+            printk(" %08x", *(p + i));
+    }
+    printk("\n");
+    unmap_vtd_domain_page(parent);
+
+    return pte_maddr;
+}
+
 const struct iommu_ops intel_iommu_ops = {
     .init = intel_iommu_domain_init,
     .hwdom_init = intel_iommu_hwdom_init,
@@ -2527,6 +2887,7 @@ const struct iommu_ops intel_iommu_ops = {
     .assign_device  = intel_iommu_assign_device,
     .teardown = iommu_domain_teardown,
     .map_page = intel_iommu_map_page,
+    .gpu_map_page = intel_iommu_gpu_map_page,
     .unmap_page = intel_iommu_unmap_page,
     .free_page_table = iommu_free_page_table,
     .reassign_device = reassign_device_ownership,
@@ -2544,6 +2905,8 @@ const struct iommu_ops intel_iommu_ops = {
     .iotlb_flush_all = intel_iommu_iotlb_flush_all,
     .get_reserved_device_memory = intel_iommu_get_reserved_device_memory,
     .dump_p2m_table = vtd_dump_p2m_table,
+    .switch_gpu_iopt = intel_iommu_switch_gpu_iopt,
+    .lookup_gpu_addr = intel_iommu_lookup_gpu_addr,
 };
 
 /*

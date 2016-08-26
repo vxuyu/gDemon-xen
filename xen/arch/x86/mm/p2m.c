@@ -2788,6 +2788,26 @@ out:
         rcu_unlock_domain(fdom);
     return rc;
 }
+
+int do_switch_gpu_iopt(int domain_id)
+{
+    /*
+    printk("xuyu: (%s:%d) start *do_switch_gpu_iopt* hypercall\n",
+            __FUNCTION__, __LINE__);
+    */
+
+    return iommu_switch_gpu_iopt(domain_id);
+}
+
+unsigned long do_lookup_gpu_addr(unsigned long addr)
+{
+    /*
+    printk("xuyu: (%s:%d) start *do_lookup_gpu_addr* hypercall, addr: %lx\n",
+            __FUNCTION__, __LINE__, addr);
+    */
+
+    return iommu_lookup_gpu_addr(addr);
+}
 /*
  * Local variables:
  * mode: C

@@ -26,6 +26,8 @@
 #define VTDPREFIX "[VT-D]"
 
 extern bool_t rwbf_quirk;
+extern u64 gpu_pgd_maddr;
+extern u64 dom_gpu_pgd_maddr[];
 
 void print_iommu_regs(struct acpi_drhd_unit *drhd);
 void print_vtd_entries(struct iommu *iommu, int bus, int devfn, u64 gmfn);
@@ -97,5 +99,6 @@ int platform_supports_intremap(void);
 int platform_supports_x2apic(void);
 
 void vtd_set_hwdom_mapping(struct domain *d);
+void vtd_set_hwdom_gpu_mapping(struct domain *d);
 
 #endif // _VTD_EXTERN_H_
